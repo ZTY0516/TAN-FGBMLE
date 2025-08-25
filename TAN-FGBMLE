@@ -1,0 +1,229 @@
+# tan_gmm_silent.py
+import numpy as np
+from sklearn.mixture import GaussianMixture
+from sklearn.preprocessing import LabelEncoder
+from scipy.stats import norm
+from collections import defaultdict
+
+def _ensure_2d(x):
+    x = np.asarray(x)
+    if x.ndim == 1:
+        return x.reshape(-1, 1)
+    return x
+
+def _bic_best_gmm(
+    X,
+    max_components=3,
+    covariance_type="full",
+    random_state=0,
+    min_samples_per_comp=3
+):
+    X = _ensure_2d(X)
+    n = len(X)
+    best, best_bic = None, np.inf
+    for k in range(1, max_components + 1):
+        if n < max(min_samples_per_comp * k, 2):
+            continue
+        gmm = GaussianMixture(
+            n_components=k,
+            covariance_type=covariance_type,
+            random_state=random_state
+        )
+        gmm.fit(X)
+        bic = gmm.bic(X)
+        if bic < best_bic:
+            best, best_bic = gmm, bic
+    return best
+
+def _fit_gaussian_fallback_1d(X):
+    X = _ensure_2d(X)
+    mu = float(np.mean(X))
+    std = float(np.std(X) + 1e-6)
+    return {'type': 'gaussian_1d', 'mean': mu, 'std': std}
+
+class TANGMM:
+    def __init__(
+        self,
+        max_gmm_components=4,
+        covariance_type="full",
+        random_state=0,
+        epsilon=1e-8
+    ):
+        self.max_gmm_components = int(max_gmm_components)
+        self.covariance_type = covariance_type
+        self.random_state = int(random_state)
+        self.epsilon = float(epsilon)
+        self.structure_edges_ = None
+        self.feature_names_ = None
+        self.classes_ = None
+        self.class_log_prior_ = None
+        self.roots_ = defaultdict(dict)
+        self.joint_ = defaultdict(dict)
+        self.parent_marginal_ = defaultdict(dict)
+        self.parents_ = None
+
+    def _compute_cmi_matrix(self, X, y_encoded):
+        X = np.asarray(X)
+        n, d = X.shape
+        c_vals, c_counts = np.unique(y_encoded, return_counts=True)
+        class_probs = c_counts / c_counts.sum()
+        CMI = np.zeros((d, d), dtype=float)
+
+        for idx_c, c in enumerate(c_vals):
+            Xc = X[y_encoded == c]
+            if len(Xc) <= 10:
+                continue
+            H1 = {}
+            for i in range(d):
+                Xi = _ensure_2d(Xc[:, i])
+                gmm_i = _bic_best_gmm(
+                    Xi, self.max_gmm_components,
+                    covariance_type=self.covariance_type,
+                    random_state=self.random_state
+                )
+                if gmm_i is None:
+                    continue
+                H1[i] = - gmm_i.score_samples(Xi).mean()
+            for i in range(d):
+                if i not in H1:
+                    continue
+                for j in range(i+1, d):
+                    if j not in H1:
+                        continue
+                    Xij = Xc[:, [i, j]]
+                    gmm_ij = _bic_best_gmm(
+                        Xij, self.max_gmm_components,
+                        covariance_type=self.covariance_type,
+                        random_state=self.random_state
+                    )
+                    if gmm_ij is None:
+                        continue
+                    Hij = - gmm_ij.score_samples(Xij).mean()
+                    I = H1[i] + H1[j] - Hij
+                    CMI[i, j] += class_probs[idx_c] * I
+                    CMI[j, i] = CMI[i, j]
+        return CMI
+
+    def _build_max_spanning_tree(self, CMI):
+        d = CMI.shape[0]
+        visited = {0}
+        edges = []
+        while len(visited) < d:
+            best = (-np.inf, None, None)
+            for u in visited:
+                for v in range(d):
+                    if v in visited:
+                        continue
+                    if CMI[u, v] > best[0]:
+                        best = (CMI[u, v], u, v)
+            _, u, v = best
+            if u is None:
+                remaining = [k for k in range(d) if k not in visited]
+                u, v = list(visited)[0], remaining[0]
+            edges.append((u, v))
+            visited.add(v)
+        return edges
+
+    def _fit_univariate(self, X):
+        X = _ensure_2d(X)
+        if len(X) < 5:
+            return _fit_gaussian_fallback_1d(X)
+        gmm = _bic_best_gmm(
+            X, self.max_gmm_components,
+            covariance_type=self.covariance_type,
+            random_state=self.random_state
+        )
+        if gmm is None:
+            return _fit_gaussian_fallback_1d(X)
+        return {'type': 'gmm_1d', 'model': gmm}
+
+    def _score_univariate(self, pack, x_scalar):
+        if pack['type'] == 'gaussian_1d':
+            return float(norm.logpdf(x_scalar, loc=pack['mean'], scale=pack['std']))
+        else:
+            return float(pack['model'].score_samples([[x_scalar]])[0])
+
+    def _fit_joint2d(self, X2d):
+        X2d = np.asarray(X2d)
+        if len(X2d) < 10:
+            m = GaussianMixture(n_components=1, covariance_type=self.covariance_type,
+                                random_state=self.random_state).fit(X2d)
+            return {'type': 'gmm_2d', 'model': m}
+        gmm = _bic_best_gmm(
+            X2d, self.max_gmm_components,
+            covariance_type=self.covariance_type,
+            random_state=self.random_state
+        )
+        if gmm is None:
+            gmm = GaussianMixture(n_components=1, covariance_type=self.covariance_type,
+                                  random_state=self.random_state).fit(X2d)
+        return {'type': 'gmm_2d', 'model': gmm}
+
+    def _score_joint2d(self, pack, x_vec2):
+        return float(pack['model'].score_samples([x_vec2])[0])
+
+    def fit(self, X, y, feature_names=None):
+        X = np.asarray(X)
+        n, d = X.shape
+        self.feature_names_ = feature_names or [f"X{i}" for i in range(d)]
+        le = LabelEncoder()
+        y_enc = le.fit_transform(y)
+        self.classes_ = le.classes_
+        counts = np.bincount(y_enc, minlength=len(self.classes_))
+        self.class_log_prior_ = np.log(counts / counts.sum() + 1e-12)
+        CMI = self._compute_cmi_matrix(X, y_enc)
+        dir_edges = self._build_max_spanning_tree(CMI)
+        self.structure_edges_ = [(self.feature_names_[u], self.feature_names_[v]) for (u, v) in dir_edges]
+        parent = np.full(d, -1, dtype=int)
+        for (u, v) in dir_edges:
+            parent[v] = u
+        self.parents_ = parent
+        for c_idx, _ in enumerate(self.classes_):
+            Xc = X[y_enc == c_idx]
+            for i in np.where(parent == -1)[0]:
+                self.roots_[c_idx][i] = self._fit_univariate(Xc[:, i])
+            for i in range(d):
+                if parent[i] == -1:
+                    continue
+                p = parent[i]
+                self.joint_[c_idx][i] = self._fit_joint2d(Xc[:, [i, p]])
+                self.parent_marginal_[c_idx][i] = self._fit_univariate(Xc[:, p])
+        return self
+
+    def _log_prob_x_given_c(self, x, c_idx):
+        x = np.asarray(x)
+        d = len(self.feature_names_)
+        lp = float(self.class_log_prior_[c_idx])
+        for i in range(d):
+            pa = self.parents_[i]
+            if pa == -1:
+                lp += self._score_univariate(self.roots_[c_idx][i], float(x[i]))
+            else:
+                lp += self._score_joint2d(self.joint_[c_idx][i], np.array([float(x[i]), float(x[pa])])) \
+                      - self._score_univariate(self.parent_marginal_[c_idx][i], float(x[pa]))
+        return lp
+
+    def predict_proba(self, X):
+        X = np.asarray(X)
+        n = len(X)
+        C = len(self.classes_)
+        logp = np.zeros((n, C), dtype=float)
+        for i in range(n):
+            for c in range(C):
+                logp[i, c] = self._log_prob_x_given_c(X[i], c)
+        logp -= logp.max(axis=1, keepdims=True)
+        p = np.exp(logp)
+        p /= p.sum(axis=1, keepdims=True)
+        return p
+
+    def predict(self, X):
+        return np.argmax(self.predict_proba(X), axis=1)
+
+    def get_class_labels(self):
+        return self.classes_
+
+    def get_structure(self, include_class_edges=True):
+        edges = list(self.structure_edges_)
+        if include_class_edges:
+            edges.extend([("C", name) for name in self.feature_names_])
+        return edges
